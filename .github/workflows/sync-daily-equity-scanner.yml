@@ -33,7 +33,7 @@ jobs:
           HTTP_STATUS=$(curl --write-out "%{http_code}" --silent --output index.html \
                -H "Authorization: token $GH_PAT" \
                -H "Accept: application/vnd.github.v3.raw" \
-               -L "https://api.github.com/repos/gitthubbard/DailyEquityScanner/contents/latest.html")
+               -L "https://api.github.com/repos/gitthubbard/DailyEquityScanner/contents/memos/latest.html")
           echo "HTTP status: $HTTP_STATUS"
           if [ "$HTTP_STATUS" -ne 200 ]; then
             echo "Error response body:"
