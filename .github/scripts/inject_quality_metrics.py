@@ -3,9 +3,11 @@ Post-processor for index.html (runs after each sync from DailyEquityScanner).
 
 Transformations applied in order:
   1. Move "High-Quality Buys" from last to second named section; renumber.
-  2. Sort Signal Matrix heatmap rows by blended conviction descending.
-  3. Collapse Signal Matrix, What Changed Overnight, Master Signal Table.
-  4. Inject ROIC % · FCF % from Quality × Valuation into Conviction Map tooltips.
+  2. Hoist Plotly <script> tags into <head> so HQ Buys chart loads correctly.
+  3. Sort Signal Matrix heatmap rows by blended conviction descending.
+  4. Collapse Signal Matrix, What Changed Overnight, Master Signal Table,
+     and Earnings Runway.
+  5. Inject ROIC % · FCF % from Quality × Valuation into Conviction Map tooltips.
 """
 import re
 import sys
@@ -21,7 +23,8 @@ COLLAPSIBLE_CSS = (
     'details.sec-body[open]>summary h2::after{content:" \\25be";}'
 )
 
-COLLAPSE_TITLES = {'Signal Matrix', 'What Changed Overnight', 'Master Signal Table'}
+COLLAPSE_TITLES = {'Signal Matrix', 'What Changed Overnight', 'Master Signal Table',
+                   'Earnings Runway'}
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -33,6 +36,39 @@ def _section_display_title(section_html):
 
 def _all_sections(html):
     return list(re.finditer(r'<section>.*?</section>', html, re.DOTALL))
+
+
+# ── 0. hoist Plotly scripts into <head> ──────────────────────────────────────
+
+def hoist_plotly_to_head(html):
+    """Move PlotlyConfig + CDN <script> tags from body into <head>.
+
+    When High-Quality Buys is section 02, its Plotly chart executes before
+    the CDN script (which lives in the Conviction Map section further down).
+    Hoisting both tags into <head> guarantees Plotly is available everywhere.
+    """
+    # Collect PlotlyConfig inline script
+    config_pat = re.compile(r'<script>window\.PlotlyConfig\s*=.*?</script>')
+    # Collect Plotly CDN script
+    cdn_pat = re.compile(
+        r'<script\s[^>]*src="https://cdn\.plot\.ly[^"]*"[^>]*></script>')
+
+    config_tags = config_pat.findall(html)
+    cdn_tags    = cdn_pat.findall(html)
+
+    if not cdn_tags:
+        return html  # nothing to hoist
+
+    # Remove all occurrences from the body
+    for tag in config_tags:
+        html = html.replace(tag, '', 1)
+    for tag in cdn_tags:
+        html = html.replace(tag, '', 1)
+
+    # Inject once into <head>, just before </head>
+    inject = ''.join(config_tags[:1]) + ''.join(cdn_tags[:1])
+    html = html.replace('</head>', inject + '</head>', 1)
+    return html
 
 
 # ── 1. move HQ Buys to slot 2 and renumber ───────────────────────────────────
@@ -224,6 +260,9 @@ def main():
 
     html = move_hq_and_renumber(html)
     print('✓ HQ section moved and sections renumbered', file=sys.stderr)
+
+    html = hoist_plotly_to_head(html)
+    print('✓ Plotly scripts hoisted into <head>', file=sys.stderr)
 
     html = sort_signal_matrix(html)
     print('✓ Signal Matrix sorted by conviction', file=sys.stderr)
