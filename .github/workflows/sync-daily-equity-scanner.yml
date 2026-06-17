@@ -3,7 +3,7 @@ name: Sync DailyEquityScanner latest.html
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 6 * * *'  # Daily at 06:00 UTC
+    - cron: '0 13 * * *'  # Daily at 8:00 AM EST (13:00 UTC)
 
 jobs:
   sync:
@@ -40,6 +40,9 @@ jobs:
             cat index.html
             exit 1
           fi
+
+      - name: Inject ROIC & FCF into Conviction Map tooltips
+        run: python3 .github/scripts/inject_quality_metrics.py index.html
 
       - name: Commit and push if changed
         run: |
