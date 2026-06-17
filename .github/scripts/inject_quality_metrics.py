@@ -252,6 +252,67 @@ def inject_quality_metrics(html, lookup):
     return html[:cm.start()] + new_cm + html[cm.end():]
 
 
+# ── 5. HQ Buys chart: x-axis → % from spot ──────────────────────────────────
+
+def convert_hq_xaxis_to_pct(html):
+    """Convert HQ Buys chart x-axis from absolute price to % distance from spot.
+
+    Each trace is a horizontal line segment with x=[low, high] symmetric around
+    the spot price (midpoint = spot exactly). We normalise so spot = 0% and each
+    endpoint becomes (price - spot) / spot * 100, giving every stock a common
+    percentage scale regardless of absolute price level.
+    """
+    segs = _all_sections(html)
+    hq_seg = next(
+        (s for s in segs if 'High-Quality' in _section_display_title(s.group(0))),
+        None)
+    if not hq_seg:
+        print('WARNING: High-Quality Buys section not found', file=sys.stderr)
+        return html
+
+    hq = hq_seg.group(0)
+
+    # Convert each trace's x values
+    def pct_trace(m):
+        t = m.group(0)
+        x_m = re.search(r'"x":\[([^\]]+)\]', t)
+        if not x_m:
+            return t
+        vals = [float(v) for v in x_m.group(1).split(',')]
+        if len(vals) != 2:
+            return t
+        spot = (vals[0] + vals[1]) / 2
+        pct = [(v - spot) / spot * 100 for v in vals]
+        new_x = f'"x":[{pct[0]},{pct[1]}]'
+        return t[:x_m.start()] + new_x + t[x_m.end():]
+
+    new_hq = re.sub(
+        r'\{"hoverinfo".*?"type":"scatter"\}',
+        pct_trace, hq, flags=re.DOTALL)
+
+    # Update x-axis: title + ticksuffix + zero reference line
+    new_hq = re.sub(
+        r'"xaxis":\{"title":\{"text":"Price[^"]*"\}',
+        '"xaxis":{"title":{"text":"Distance from spot  →"},"ticksuffix":"%"',
+        new_hq)
+
+    # Add a vertical reference line at x=0 (the spot price) if shapes exist
+    if '"shapes":[' in new_hq:
+        zero_line = (
+            '{"line":{"color":"rgba(31,42,51,0.25)","width":1,"dash":"dot"},'
+            '"type":"line","x0":0,"x1":0,"xref":"x","y0":0,"y1":1,"yref":"y domain"},'
+        )
+        new_hq = new_hq.replace('"shapes":[', '"shapes":[' + zero_line, 1)
+    else:
+        zero_line = (
+            '"shapes":[{"line":{"color":"rgba(31,42,51,0.25)","width":1,"dash":"dot"},'
+            '"type":"line","x0":0,"x1":0,"xref":"x","y0":0,"y1":1,"yref":"y domain"}],'
+        )
+        new_hq = new_hq.replace('"template":', zero_line + '"template":', 1)
+
+    return html[:hq_seg.start()] + new_hq + html[hq_seg.end():]
+
+
 # ── main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -270,6 +331,9 @@ def main():
     html = make_collapsible(html)
     html = inject_css(html)
     print('✓ Collapsible sections applied', file=sys.stderr)
+
+    html = convert_hq_xaxis_to_pct(html)
+    print('✓ HQ Buys x-axis converted to % from spot', file=sys.stderr)
 
     lookup = build_quality_lookup(html)
     print(f'✓ Quality lookup: {len(lookup)} tickers', file=sys.stderr)
