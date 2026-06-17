@@ -344,12 +344,23 @@ def convert_hq_xaxis_to_pct(html):
             return trace
         s = spot[ticker]
 
-        def repl(m):
-            vals = [float(v) for v in m.group(1).split(',')]
-            pct = [(v - s) / s * 100 for v in vals]
-            return '"x":[' + ','.join(repr(p) for p in pct) + ']'
+        xm = re.search(r'"x":\[([^\]]+)\]', trace)
+        if not xm:
+            return trace
+        orig = [float(v) for v in xm.group(1).split(',')]
+        pct = [(v - s) / s * 100 for v in orig]
+        trace = (trace[:xm.start()]
+                 + '"x":[' + ','.join(repr(p) for p in pct) + ']'
+                 + trace[xm.end():])
 
-        return re.sub(r'"x":\[([^\]]+)\]', repl, trace, count=1)
+        # Markers carry a "$%{x:.2f}" hover — x is now a percent, so stash the
+        # original dollar price in customdata and show both $ and % from spot.
+        if '"hovertemplate"' in trace and 'customdata' not in trace:
+            cd = '"customdata":[' + ','.join(repr(v) for v in orig) + '],'
+            trace = trace.replace('"hovertemplate":', cd + '"hovertemplate":', 1)
+            trace = trace.replace(
+                '$%{x:.2f}', '$%{customdata:.2f} (%{x:+.1f}% from spot)', 1)
+        return trace
 
     new_traces = [convert(t) for t in traces]
 
