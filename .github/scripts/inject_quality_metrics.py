@@ -254,13 +254,39 @@ def inject_quality_metrics(html, lookup):
 
 # ── 5. HQ Buys chart: x-axis → % from spot ──────────────────────────────────
 
+def _split_trace_objects(data_str):
+    """Split a Plotly data array body into top-level {..} trace substrings."""
+    traces, depth, start = [], 0, None
+    for i, c in enumerate(data_str):
+        if c == '{':
+            if depth == 0:
+                start = i
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                traces.append((start, i + 1))
+    return traces
+
+
+def _first_ticker(trace):
+    ym = re.search(r'"y":\[([^\]]*)\]', trace)
+    if not ym:
+        return None
+    names = re.findall(r'"([^"]+)"', ym.group(1))
+    return names[0] if names else None
+
+
 def convert_hq_xaxis_to_pct(html):
     """Convert HQ Buys chart x-axis from absolute price to % distance from spot.
 
-    Each trace is a horizontal line segment with x=[low, high] symmetric around
-    the spot price (midpoint = spot exactly). We normalise so spot = 0% and each
-    endpoint becomes (price - spot) / spot * 100, giving every stock a common
-    percentage scale regardless of absolute price level.
+    The chart has 5 traces per stock: the expected-move/gamma band (thick line),
+    the spot diamond, put-wall, call-wall, and gamma-flip markers — all in raw
+    dollar prices. We build a {ticker: spot} map from the diamond markers, then
+    convert EVERY x value of EVERY trace using that stock's own spot price:
+        pct = (price - spot) / spot * 100
+    so spot sits at 0% and every stock shares one percentage scale regardless of
+    absolute price level.
     """
     segs = _all_sections(html)
     hq_seg = next(
@@ -272,43 +298,86 @@ def convert_hq_xaxis_to_pct(html):
 
     hq = hq_seg.group(0)
 
-    # Convert each trace's x values
-    def pct_trace(m):
-        t = m.group(0)
-        x_m = re.search(r'"x":\[([^\]]+)\]', t)
-        if not x_m:
-            return t
-        vals = [float(v) for v in x_m.group(1).split(',')]
-        if len(vals) != 2:
-            return t
-        spot = (vals[0] + vals[1]) / 2
-        pct = [(v - spot) / spot * 100 for v in vals]
-        new_x = f'"x":[{pct[0]},{pct[1]}]'
-        return t[:x_m.start()] + new_x + t[x_m.end():]
+    # Locate the data array of the newPlot call (first balanced [ ... ]).
+    np_m = re.search(r'Plotly\.newPlot\(\s*"[^"]+",\s*', hq)
+    if not np_m:
+        print('WARNING: HQ newPlot call not found', file=sys.stderr)
+        return html
+    arr_start = hq.index('[', np_m.end())
+    depth = 0
+    arr_end = None
+    for i in range(arr_start, len(hq)):
+        if hq[i] == '[':
+            depth += 1
+        elif hq[i] == ']':
+            depth -= 1
+            if depth == 0:
+                arr_end = i + 1
+                break
+    if arr_end is None:
+        return html
 
-    new_hq = re.sub(
-        r'\{"hoverinfo".*?"type":"scatter"\}',
-        pct_trace, hq, flags=re.DOTALL)
+    data = hq[arr_start:arr_end]
+    spans = _split_trace_objects(data)
+    traces = [data[a:b] for a, b in spans]
 
-    # Update x-axis: title + ticksuffix + zero reference line
+    # Pass 1 — build {ticker: spot} from diamond markers.
+    spot = {}
+    for t in traces:
+        if '"symbol":"diamond"' in t:
+            ticker = _first_ticker(t)
+            xm = re.search(r'"x":\[([^\]]*)\]', t)
+            if ticker and xm:
+                try:
+                    spot[ticker] = float(xm.group(1).split(',')[0])
+                except ValueError:
+                    pass
+
+    if not spot:
+        print('WARNING: no spot diamonds found in HQ chart', file=sys.stderr)
+        return html
+
+    # Pass 2 — convert every trace's x values using its own stock's spot.
+    def convert(trace):
+        ticker = _first_ticker(trace)
+        if ticker not in spot or spot[ticker] == 0:
+            return trace
+        s = spot[ticker]
+
+        def repl(m):
+            vals = [float(v) for v in m.group(1).split(',')]
+            pct = [(v - s) / s * 100 for v in vals]
+            return '"x":[' + ','.join(repr(p) for p in pct) + ']'
+
+        return re.sub(r'"x":\[([^\]]+)\]', repl, trace, count=1)
+
+    new_traces = [convert(t) for t in traces]
+
+    # Reassemble the data array, preserving the separators between traces.
+    new_data = data[:spans[0][0]]
+    for idx, (a, b) in enumerate(spans):
+        new_data += new_traces[idx]
+        sep_end = spans[idx + 1][0] if idx + 1 < len(spans) else len(data)
+        new_data += data[b:sep_end]
+
+    new_hq = hq[:arr_start] + new_data + hq[arr_end:]
+
+    # Update x-axis: title + percent ticks.
     new_hq = re.sub(
         r'"xaxis":\{"title":\{"text":"Price[^"]*"\}',
         '"xaxis":{"title":{"text":"Distance from spot  →"},"ticksuffix":"%"',
         new_hq)
 
-    # Add a vertical reference line at x=0 (the spot price) if shapes exist
+    # Add a dotted vertical reference line at x=0 (spot).
+    zero_line = (
+        '{"line":{"color":"rgba(31,42,51,0.25)","width":1,"dash":"dot"},'
+        '"type":"line","x0":0,"x1":0,"xref":"x","y0":0,"y1":1,"yref":"y domain"}'
+    )
     if '"shapes":[' in new_hq:
-        zero_line = (
-            '{"line":{"color":"rgba(31,42,51,0.25)","width":1,"dash":"dot"},'
-            '"type":"line","x0":0,"x1":0,"xref":"x","y0":0,"y1":1,"yref":"y domain"},'
-        )
-        new_hq = new_hq.replace('"shapes":[', '"shapes":[' + zero_line, 1)
+        new_hq = new_hq.replace('"shapes":[', '"shapes":[' + zero_line + ',', 1)
     else:
-        zero_line = (
-            '"shapes":[{"line":{"color":"rgba(31,42,51,0.25)","width":1,"dash":"dot"},'
-            '"type":"line","x0":0,"x1":0,"xref":"x","y0":0,"y1":1,"yref":"y domain"}],'
-        )
-        new_hq = new_hq.replace('"template":', zero_line + '"template":', 1)
+        new_hq = new_hq.replace(
+            '"template":', '"shapes":[' + zero_line + '],"template":', 1)
 
     return html[:hq_seg.start()] + new_hq + html[hq_seg.end():]
 
