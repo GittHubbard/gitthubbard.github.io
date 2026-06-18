@@ -289,7 +289,7 @@ def build_quality_lookup(html):
     lookup = {}
     for block in re.findall(r'"hovertext":\[(.*?)\]', s.group(0), re.DOTALL):
         for item in re.findall(r'"(\\u003cb\\u003e.*?)"', block):
-            tm = re.match(r'\\u003cb\\u003e(\w+)\\u003c\\u002fb\\u003e', item)
+            tm = re.match(r'\\u003cb\\u003e([\w.]+)\\u003c\\u002fb\\u003e', item)
             if not tm:
                 continue
             ticker = tm.group(1)
@@ -313,7 +313,7 @@ def inject_quality_metrics(html, lookup):
 
     def patch(m):
         item = m.group(1)
-        tm = re.match(r'\\u003cb\\u003e(\w+)\\u003c', item)
+        tm = re.match(r'\\u003cb\\u003e([\w.]+)\\u003c', item)
         if not tm or tm.group(1) not in lookup:
             return m.group(0)
         ticker = tm.group(1)
@@ -455,7 +455,141 @@ def convert_hq_xaxis_to_pct(html):
     return html[:hq_seg.start()] + new_hq + html[hq_seg.end():]
 
 
-# ── 6. COT Positioning Regime → Macro & Regime section ───────────────────────
+# ── 6. QV company names + Conviction Map FCF bubble sizing ───────────────────
+
+def _balanced_slice(s, start, open_c='[', close_c=']'):
+    """Return (start, end) spanning the balanced open_c…close_c beginning at start."""
+    depth = 0
+    for i in range(start, len(s)):
+        if s[i] == open_c:
+            depth += 1
+        elif s[i] == close_c:
+            depth -= 1
+            if depth == 0:
+                return start, i + 1
+    return start, len(s)
+
+
+def _hovertext_entries(trace):
+    """Return list of hovertext string contents from a trace object."""
+    m = re.search(r'"hovertext":\[', trace)
+    if not m:
+        return []
+    lo, hi = _balanced_slice(trace, m.end() - 1)
+    return re.findall(r'"([^"]+)"', trace[lo + 1:hi - 1])
+
+
+def build_company_name_lookup(html):
+    """Extract {ticker: company_name} from Conviction Map hovertext."""
+    segs = _all_sections(html)
+    cm_seg = next(
+        (s for s in segs if 'Conviction Map' in _section_display_title(s.group(0))),
+        None)
+    if not cm_seg:
+        return {}
+    lookup = {}
+    # Each CM entry: <b>TICKER</b> — Company Name<br>
+    for m in re.finditer(
+        r'\\u003cb\\u003e([\w.]+)\\u003c\\u002fb\\u003e \\u2014 ([^\\]+?)\\u003cbr\\u003e',
+        cm_seg.group(0)
+    ):
+        lookup[m.group(1)] = m.group(2).strip()
+    return lookup
+
+
+def inject_qv_company_names(html, name_lookup):
+    """Inject 'TICKER — Company Name' into Quality × Valuation hovertext."""
+    if not name_lookup:
+        return html
+    segs = _all_sections(html)
+    qv_seg = next(
+        (s for s in segs
+         if 'Quality' in _section_display_title(s.group(0))
+         and 'Valuation' in _section_display_title(s.group(0))),
+        None)
+    if not qv_seg:
+        return html
+
+    emdash = '\\u2014'  # literal — in file → renders as —
+
+    # Idempotency marker: the exact sequence </b> — (em-dash as company separator)
+    sep = '\\u003c\\u002fb\\u003e ' + emdash
+
+    def patch(m):
+        item = m.group(1)
+        if sep in item:  # company name already present — idempotent
+            return m.group(0)
+        tm = re.match(r'\\u003cb\\u003e([\w.]+)\\u003c\\u002fb\\u003e', item)
+        if not tm or tm.group(1) not in name_lookup:
+            return m.group(0)
+        company = name_lookup[tm.group(1)]
+        insert  = f' {emdash} {company}'
+        patched = re.sub(
+            r'(\\u003cb\\u003e[\w.]+\\u003c\\u002fb\\u003e)(\\u003cbr\\u003e)',
+            lambda mo: mo.group(1) + insert + mo.group(2),
+            item, count=1)
+        return f'"{patched}"'
+
+    new_qv = re.sub(r'"(\\u003cb\\u003e[^"]+)"', patch, qv_seg.group(0))
+    return html[:qv_seg.start()] + new_qv + html[qv_seg.end():]
+
+
+def _fcf_to_size(fcf_pct, lo=8.0, hi=22.0, no_data=12.0, scale=1.4):
+    """Map FCF yield % to a marker radius.  Negative/unknown → floor."""
+    if fcf_pct is None:
+        return no_data
+    return round(min(hi, max(lo, lo + max(0.0, fcf_pct) * scale)), 2)
+
+
+def scale_conviction_map_by_fcf(html):
+    """Resize Conviction Map bubbles proportional to FCF yield %."""
+    segs = _all_sections(html)
+    cm_seg = next(
+        (s for s in segs if 'Conviction Map' in _section_display_title(s.group(0))),
+        None)
+    if not cm_seg:
+        return html
+
+    cm = cm_seg.group(0)
+    np_m = re.search(r'Plotly\.newPlot\(\s*"[^"]+",\s*', cm)
+    if not np_m:
+        return html
+
+    arr_lo, arr_hi = _balanced_slice(cm, cm.index('[', np_m.end()))
+    data  = cm[arr_lo:arr_hi]
+    spans = _split_trace_objects(data)
+
+    new_traces = []
+    for a, b in spans:
+        tr      = data[a:b]
+        entries = _hovertext_entries(tr)
+        if not entries:
+            new_traces.append(tr)
+            continue
+
+        fcf_vals = []
+        for entry in entries:
+            fcf_m = re.search(r'FCF ([+-]?\d+\.?\d*)%', entry)
+            fcf_vals.append(float(fcf_m.group(1)) if fcf_m else None)
+
+        new_sizes = [_fcf_to_size(f) for f in fcf_vals]
+        tr = re.sub(
+            r'"size":\[[^\]]*\]',
+            '"size":[' + ','.join(repr(s) for s in new_sizes) + ']',
+            tr, count=1)
+        new_traces.append(tr)
+
+    new_data = data[:spans[0][0]]
+    for idx, (a, b) in enumerate(spans):
+        new_data += new_traces[idx]
+        sep_end   = spans[idx + 1][0] if idx + 1 < len(spans) else len(data)
+        new_data += data[b:sep_end]
+
+    new_cm = cm[:arr_lo] + new_data + cm[arr_hi:]
+    return html[:cm_seg.start()] + new_cm + html[cm_seg.end():]
+
+
+# ── 8. COT Positioning Regime → Macro & Regime section ───────────────────────
 
 def extract_cot_regime_block(cot_html):
     """
@@ -519,7 +653,7 @@ def inject_cot_into_macro_regime(index_html, cot_block):
     return index_html[:macro_seg.start()] + new_section + index_html[macro_seg.end():]
 
 
-# ── 7. Page navigation ────────────────────────────────────────────────────────
+# ── 9. Page navigation ────────────────────────────────────────────────────────
 
 def add_index_nav(html):
     """Inject nav bar CSS and HTML into index.html (idempotent)."""
@@ -588,6 +722,14 @@ def main():
         print(f'✓ Quality lookup: {len(lookup)} tickers', file=sys.stderr)
         html = inject_quality_metrics(html, lookup)
         print('✓ ROIC/FCF injected into Conviction Map', file=sys.stderr)
+
+        name_lookup = build_company_name_lookup(html)
+        print(f'✓ Company name lookup: {len(name_lookup)} tickers', file=sys.stderr)
+        html = inject_qv_company_names(html, name_lookup)
+        print('✓ Company names injected into Quality × Valuation', file=sys.stderr)
+
+        html = scale_conviction_map_by_fcf(html)
+        print('✓ Conviction Map bubbles scaled by FCF yield', file=sys.stderr)
 
     # COT Positioning Regime injection
     cot_html = None
