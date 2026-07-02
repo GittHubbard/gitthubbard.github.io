@@ -55,7 +55,12 @@ jobs:
             echo "No changes to commit"
           else
             git commit -m "chore: sync index.html from DailyEquityScanner/latest.html"
-            git push
+            # Retry to survive the other job pushing to main concurrently.
+            for i in 1 2 3 4 5; do
+              git push && break
+              echo "push rejected (attempt $i); rebasing on latest main..."
+              git pull --rebase origin main
+            done
           fi
 
   sync-cot-analysis:
@@ -109,5 +114,10 @@ jobs:
             echo "No changes to commit"
           else
             git commit -m "chore: sync COT_Analysis_Latest.html from COT-Analysis/memo"
-            git push
+            # Retry to survive the other job pushing to main concurrently.
+            for i in 1 2 3 4 5; do
+              git push && break
+              echo "push rejected (attempt $i); rebasing on latest main..."
+              git pull --rebase origin main
+            done
           fi
