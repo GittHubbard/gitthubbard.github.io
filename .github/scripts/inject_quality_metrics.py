@@ -1,38 +1,29 @@
 """
 Post-processor for index.html (runs after each sync from DailyEquityScanner).
 
-Transformations applied in order:
-  1. Move "High-Quality Buys" from last to second named section; renumber.
-  2. Hoist Plotly <script> tags into <head> so HQ Buys chart loads correctly.
-  3. Sort Signal Matrix heatmap rows by blended conviction descending.
-  4. Collapse Signal Matrix, What Changed Overnight, Master Signal Table,
-     and Earnings Runway.
-  5. Convert HQ Buys chart x-axis from $ to % from spot (per stock).
-  6. Inject ROIC % · FCF % from Quality × Valuation into Conviction Map tooltips.
-  7. Inject COT Positioning Regime into Macro & Regime (when COT file present).
-  8. Add page navigation bar to index.html and COT_Analysis_Latest.html.
+As of 2026-07, the DailyEquityScanner source now natively produces most of the
+enhancements this script used to apply (section ordering/numbering, Plotly in
+<head>, collapsible sections, HQ %-from-spot axis, ROIC/FCF in the Conviction
+Map, company names in Quality × Valuation, and FCF-scaled bubbles, plus the page
+navigation bar). Those transforms have been removed as redundant.
+
+What remains here is only what the source does NOT do:
+  1. Sort the Signal Matrix heatmap rows by blended conviction (descending).
+  2. Inject the COT Positioning Regime (from COT_Analysis_Latest.html, a
+     different repo) into the "Macro & Regime" section, plus its CSS.
+  3. Add a navigation bar to COT_Analysis_Latest.html so it can link back to
+     the Daily Brief (the COT-Analysis repo does not ship one).
 
 Usage:
   python3 inject_quality_metrics.py index.html [COT_Analysis_Latest.html] [--cot-only]
 
-  --cot-only  Skip structural transforms (1-6); only apply COT injection and
-              navigation. Use when index.html is already processed and only the
-              COT content / nav needs to be refreshed.
+  --cot-only  Skip the Signal Matrix sort; only apply COT injection and the
+              COT-page nav. Used by the Friday COT sync job, where index.html is
+              already processed and only the COT content needs refreshing.
 """
 import os
 import re
 import sys
-
-BR  = '\\u003cbr\\u003e'
-DOT = '\\u00b7'
-
-COLLAPSIBLE_CSS = (
-    'details.sec-body>summary{list-style:none;cursor:pointer;user-select:none;}'
-    'details.sec-body>summary::-webkit-details-marker{display:none;}'
-    'details.sec-body>summary h2::after{content:" \\25b8";color:var(--faint);'
-    'font-size:11px;font-family:sans-serif;vertical-align:middle;margin-left:6px;}'
-    'details.sec-body[open]>summary h2::after{content:" \\25be";}'
-)
 
 COT_BLOCK_CSS = (
     '.cot-regime{margin-top:16px;padding:12px 16px;border-left:3px solid #6a4ca5;'
@@ -54,23 +45,6 @@ COT_BLOCK_CSS = (
     '.cot-tbl th{background:rgba(31,42,51,.06);font-weight:600;}'
 )
 
-NAV_CSS = (
-    '.page-nav{display:flex;gap:0;border-bottom:1px solid rgba(31,42,51,.12);margin:0 0 4px;}'
-    '.page-nav a{padding:8px 16px;font-family:Georgia,"Times New Roman",serif;'
-    'font-size:13px;text-decoration:none;color:var(--faint,#6b7280);'
-    'border-bottom:2px solid transparent;margin-bottom:-1px;}'
-    '.page-nav a:hover{color:var(--text,#1f2a33);}'
-    '.page-nav a.nav-cur{color:var(--text,#1f2a33);font-weight:600;'
-    'border-bottom-color:var(--text,#1f2a33);}'
-)
-
-INDEX_NAV_HTML = (
-    '<nav class="page-nav">'
-    '<a href="index.html" class="nav-cur">Daily Brief</a>'
-    '<a href="COT_Analysis_Latest.html">COT Analysis</a>'
-    '</nav>'
-)
-
 COT_NAV_HTML = (
     '<nav class="page-nav">'
     '<a href="index.html">Daily Brief</a>'
@@ -86,9 +60,6 @@ COT_NAV_CSS = (
     '.page-nav a:hover{color:#1f2a33;}'
     '.page-nav a.nav-cur{color:#1f2a33;font-weight:600;border-bottom-color:#1f2a33;}'
 )
-
-COLLAPSE_TITLES = {'Signal Matrix', 'What Changed Overnight', 'Master Signal Table',
-                   'Earnings Runway'}
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -122,64 +93,7 @@ def _extract_div_balanced(html, start):
     return html[start:]
 
 
-# ── 0. hoist Plotly scripts into <head> ──────────────────────────────────────
-
-def hoist_plotly_to_head(html):
-    config_pat = re.compile(r'<script>window\.PlotlyConfig\s*=.*?</script>')
-    cdn_pat    = re.compile(
-        r'<script\s[^>]*src="https://cdn\.plot\.ly[^"]*"[^>]*></script>')
-
-    config_tags = config_pat.findall(html)
-    cdn_tags    = cdn_pat.findall(html)
-
-    if not cdn_tags:
-        return html
-
-    # Check if already in <head>
-    head_end = html.find('</head>')
-    if head_end != -1 and cdn_tags and cdn_tags[0] in html[:head_end]:
-        return html  # already hoisted — idempotent
-
-    for tag in config_tags:
-        html = html.replace(tag, '', 1)
-    for tag in cdn_tags:
-        html = html.replace(tag, '', 1)
-
-    inject = ''.join(config_tags[:1]) + ''.join(cdn_tags[:1])
-    html = html.replace('</head>', inject + '</head>', 1)
-    return html
-
-
-# ── 1. move HQ Buys to slot 2 and renumber ───────────────────────────────────
-
-def move_hq_and_renumber(html):
-    segs = _all_sections(html)
-    bodies = [s.group(0) for s in segs]
-
-    named = bodies[1:]  # bodies[0] is unnumbered chips row
-
-    hq_idx = next(
-        (i for i, b in enumerate(named) if 'High-Quality' in _section_display_title(b)),
-        None)
-    if hq_idx is None:
-        print('WARNING: High-Quality Buys section not found', file=sys.stderr)
-        return html
-
-    hq = named.pop(hq_idx)
-    named.insert(1, hq)
-
-    renumbered = []
-    for i, body in enumerate(named, 1):
-        body = re.sub(r'<span class="n">\d+</span>',
-                      f'<span class="n">{i:02d}</span>', body, count=1)
-        renumbered.append(body)
-
-    pre  = html[:segs[0].start()]
-    post = html[segs[-1].end():]
-    return pre + bodies[0] + ''.join(renumbered) + post
-
-
-# ── 2. sort Signal Matrix rows by mean-z descending ──────────────────────────
+# ── 1. sort Signal Matrix rows by mean-z descending ──────────────────────────
 
 def _parse_nested_array(s):
     return [[x.strip() for x in row.split(',')]
@@ -230,6 +144,9 @@ def sort_signal_matrix(html):
         return html
 
     order = sorted(range(len(y)), key=lambda i: _row_mean(z[i]), reverse=True)
+    if order == list(range(len(y))):
+        return html  # already sorted — idempotent
+
     y    = [y[i]    for i in order]
     z    = [z[i]    for i in order]
     text = [text[i] for i in order]
@@ -247,349 +164,7 @@ def sort_signal_matrix(html):
     return html[:sm_seg.start()] + new_sm + html[sm_seg.end():]
 
 
-# ── 3. collapse specified sections ───────────────────────────────────────────
-
-def make_collapsible(html):
-    def wrap(m):
-        inner = m.group(1)
-        if inner.startswith('<details class="sec-body">'):
-            return m.group(0)  # already collapsed — idempotent
-        title = _section_display_title(inner).replace('&amp;', '&')
-        if title not in COLLAPSE_TITLES:
-            return m.group(0)
-        h2_m = re.search(r'<h2>.*?</h2>', inner)
-        if not h2_m:
-            return m.group(0)
-        h2   = h2_m.group(0)
-        rest = inner[h2_m.end():]
-        return (f'<section>'
-                f'<details class="sec-body">'
-                f'<summary>{h2}</summary>'
-                f'{rest}'
-                f'</details>'
-                f'</section>')
-
-    return re.sub(r'<section>(.*?)</section>', wrap, html, flags=re.DOTALL)
-
-
-def inject_css(html):
-    if COLLAPSIBLE_CSS in html:
-        return html  # idempotent
-    return html.replace('</style>', COLLAPSIBLE_CSS + '</style>', 1)
-
-
-# ── 4. ROIC / FCF injection into Conviction Map ──────────────────────────────
-
-def build_quality_lookup(html):
-    s = re.search(r'Quality\s*[×x]\s*Valuation.*?(?=<h2>)', html, re.DOTALL)
-    if not s:
-        print('WARNING: Quality × Valuation section not found', file=sys.stderr)
-        return {}
-
-    lookup = {}
-    for block in re.findall(r'"hovertext":\[(.*?)\]', s.group(0), re.DOTALL):
-        for item in re.findall(r'"(\\u003cb\\u003e.*?)"', block):
-            tm = re.match(r'\\u003cb\\u003e([\w.]+)\\u003c\\u002fb\\u003e', item)
-            if not tm:
-                continue
-            ticker = tm.group(1)
-            parts  = item.split('\\u003cbr\\u003e')
-            if len(parts) < 3:
-                continue
-            rm = re.search(r'ROIC\s+(\S+)', parts[1])
-            fm = re.search(r'^FCF\s+(\S+)',  parts[2])
-            if rm and fm:
-                lookup[ticker] = f'ROIC {rm.group(1)} {DOT} FCF {fm.group(1)}'
-    return lookup
-
-
-def inject_quality_metrics(html, lookup):
-    if not lookup:
-        return html
-
-    cm = re.search(r'Conviction Map.*?(?=<h2>)', html, re.DOTALL)
-    if not cm:
-        return html
-
-    def patch(m):
-        item = m.group(1)
-        tm = re.match(r'\\u003cb\\u003e([\w.]+)\\u003c', item)
-        if not tm or tm.group(1) not in lookup:
-            return m.group(0)
-        ticker = tm.group(1)
-        if lookup[ticker] in item:  # already injected — idempotent
-            return m.group(0)
-        patched, n = re.subn(
-            r'(\\u003cbr\\u003eUpside.*?Technicals \w+)',
-            lambda mo: mo.group(1) + BR + lookup[ticker],
-            item, count=1)
-        return f'"{patched}"' if n else m.group(0)
-
-    new_cm = re.sub(r'"(\\u003cb\\u003e[^"]+)"', patch, cm.group(0))
-    return html[:cm.start()] + new_cm + html[cm.end():]
-
-
-# ── 5. HQ Buys chart: x-axis → % from spot ──────────────────────────────────
-
-def _split_trace_objects(data_str):
-    traces, depth, start = [], 0, None
-    for i, c in enumerate(data_str):
-        if c == '{':
-            if depth == 0:
-                start = i
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth == 0:
-                traces.append((start, i + 1))
-    return traces
-
-
-def _first_ticker(trace):
-    ym = re.search(r'"y":\[([^\]]*)\]', trace)
-    if not ym:
-        return None
-    names = re.findall(r'"([^"]+)"', ym.group(1))
-    return names[0] if names else None
-
-
-def convert_hq_xaxis_to_pct(html):
-    segs = _all_sections(html)
-    hq_seg = next(
-        (s for s in segs if 'High-Quality' in _section_display_title(s.group(0))),
-        None)
-    if not hq_seg:
-        print('WARNING: High-Quality Buys section not found', file=sys.stderr)
-        return html
-
-    hq = hq_seg.group(0)
-
-    # Skip if already converted (idempotent)
-    if '"Distance from spot' in hq:
-        return html
-
-    np_m = re.search(r'Plotly\.newPlot\(\s*"[^"]+",\s*', hq)
-    if not np_m:
-        print('WARNING: HQ newPlot call not found', file=sys.stderr)
-        return html
-    arr_start = hq.index('[', np_m.end())
-    depth = 0
-    arr_end = None
-    for i in range(arr_start, len(hq)):
-        if hq[i] == '[':
-            depth += 1
-        elif hq[i] == ']':
-            depth -= 1
-            if depth == 0:
-                arr_end = i + 1
-                break
-    if arr_end is None:
-        return html
-
-    data = hq[arr_start:arr_end]
-    spans = _split_trace_objects(data)
-    traces = [data[a:b] for a, b in spans]
-
-    spot = {}
-    for t in traces:
-        if '"symbol":"diamond"' in t:
-            ticker = _first_ticker(t)
-            xm = re.search(r'"x":\[([^\]]*)\]', t)
-            if ticker and xm:
-                try:
-                    spot[ticker] = float(xm.group(1).split(',')[0])
-                except ValueError:
-                    pass
-
-    if not spot:
-        print('WARNING: no spot diamonds found in HQ chart', file=sys.stderr)
-        return html
-
-    def convert(trace):
-        ticker = _first_ticker(trace)
-        if ticker not in spot or spot[ticker] == 0:
-            return trace
-        s = spot[ticker]
-
-        xm = re.search(r'"x":\[([^\]]+)\]', trace)
-        if not xm:
-            return trace
-        orig = [float(v) for v in xm.group(1).split(',')]
-        pct = [(v - s) / s * 100 for v in orig]
-        trace = (trace[:xm.start()]
-                 + '"x":[' + ','.join(repr(p) for p in pct) + ']'
-                 + trace[xm.end():])
-
-        if '"hovertemplate"' in trace and 'customdata' not in trace:
-            cd = '"customdata":[' + ','.join(repr(v) for v in orig) + '],'
-            trace = trace.replace('"hovertemplate":', cd + '"hovertemplate":', 1)
-            trace = trace.replace(
-                '$%{x:.2f}', '$%{customdata:.2f} (%{x:+.1f}% from spot)', 1)
-        return trace
-
-    new_traces = [convert(t) for t in traces]
-
-    new_data = data[:spans[0][0]]
-    for idx, (a, b) in enumerate(spans):
-        new_data += new_traces[idx]
-        sep_end = spans[idx + 1][0] if idx + 1 < len(spans) else len(data)
-        new_data += data[b:sep_end]
-
-    new_hq = hq[:arr_start] + new_data + hq[arr_end:]
-
-    new_hq = re.sub(
-        r'"xaxis":\{"title":\{"text":"Price[^"]*"\}',
-        '"xaxis":{"title":{"text":"Distance from spot  →"},"ticksuffix":"%"',
-        new_hq)
-
-    zero_line = (
-        '{"line":{"color":"rgba(31,42,51,0.25)","width":1,"dash":"dot"},'
-        '"type":"line","x0":0,"x1":0,"xref":"x","y0":0,"y1":1,"yref":"y domain"}'
-    )
-    if '"shapes":[' in new_hq:
-        new_hq = new_hq.replace('"shapes":[', '"shapes":[' + zero_line + ',', 1)
-    else:
-        new_hq = new_hq.replace(
-            '"template":', '"shapes":[' + zero_line + '],"template":', 1)
-
-    return html[:hq_seg.start()] + new_hq + html[hq_seg.end():]
-
-
-# ── 6. QV company names + Conviction Map FCF bubble sizing ───────────────────
-
-def _balanced_slice(s, start, open_c='[', close_c=']'):
-    """Return (start, end) spanning the balanced open_c…close_c beginning at start."""
-    depth = 0
-    for i in range(start, len(s)):
-        if s[i] == open_c:
-            depth += 1
-        elif s[i] == close_c:
-            depth -= 1
-            if depth == 0:
-                return start, i + 1
-    return start, len(s)
-
-
-def _hovertext_entries(trace):
-    """Return list of hovertext string contents from a trace object."""
-    m = re.search(r'"hovertext":\[', trace)
-    if not m:
-        return []
-    lo, hi = _balanced_slice(trace, m.end() - 1)
-    return re.findall(r'"([^"]+)"', trace[lo + 1:hi - 1])
-
-
-def build_company_name_lookup(html):
-    """Extract {ticker: company_name} from Conviction Map hovertext."""
-    segs = _all_sections(html)
-    cm_seg = next(
-        (s for s in segs if 'Conviction Map' in _section_display_title(s.group(0))),
-        None)
-    if not cm_seg:
-        return {}
-    lookup = {}
-    # Each CM entry: <b>TICKER</b> — Company Name<br>
-    for m in re.finditer(
-        r'\\u003cb\\u003e([\w.]+)\\u003c\\u002fb\\u003e \\u2014 ([^\\]+?)\\u003cbr\\u003e',
-        cm_seg.group(0)
-    ):
-        lookup[m.group(1)] = m.group(2).strip()
-    return lookup
-
-
-def inject_qv_company_names(html, name_lookup):
-    """Inject 'TICKER — Company Name' into Quality × Valuation hovertext."""
-    if not name_lookup:
-        return html
-    segs = _all_sections(html)
-    qv_seg = next(
-        (s for s in segs
-         if 'Quality' in _section_display_title(s.group(0))
-         and 'Valuation' in _section_display_title(s.group(0))),
-        None)
-    if not qv_seg:
-        return html
-
-    emdash = '\\u2014'  # literal — in file → renders as —
-
-    # Idempotency marker: the exact sequence </b> — (em-dash as company separator)
-    sep = '\\u003c\\u002fb\\u003e ' + emdash
-
-    def patch(m):
-        item = m.group(1)
-        if sep in item:  # company name already present — idempotent
-            return m.group(0)
-        tm = re.match(r'\\u003cb\\u003e([\w.]+)\\u003c\\u002fb\\u003e', item)
-        if not tm or tm.group(1) not in name_lookup:
-            return m.group(0)
-        company = name_lookup[tm.group(1)]
-        insert  = f' {emdash} {company}'
-        patched = re.sub(
-            r'(\\u003cb\\u003e[\w.]+\\u003c\\u002fb\\u003e)(\\u003cbr\\u003e)',
-            lambda mo: mo.group(1) + insert + mo.group(2),
-            item, count=1)
-        return f'"{patched}"'
-
-    new_qv = re.sub(r'"(\\u003cb\\u003e[^"]+)"', patch, qv_seg.group(0))
-    return html[:qv_seg.start()] + new_qv + html[qv_seg.end():]
-
-
-def _fcf_to_size(fcf_pct, lo=8.0, hi=22.0, no_data=12.0, scale=1.4):
-    """Map FCF yield % to a marker radius.  Negative/unknown → floor."""
-    if fcf_pct is None:
-        return no_data
-    return round(min(hi, max(lo, lo + max(0.0, fcf_pct) * scale)), 2)
-
-
-def scale_conviction_map_by_fcf(html):
-    """Resize Conviction Map bubbles proportional to FCF yield %."""
-    segs = _all_sections(html)
-    cm_seg = next(
-        (s for s in segs if 'Conviction Map' in _section_display_title(s.group(0))),
-        None)
-    if not cm_seg:
-        return html
-
-    cm = cm_seg.group(0)
-    np_m = re.search(r'Plotly\.newPlot\(\s*"[^"]+",\s*', cm)
-    if not np_m:
-        return html
-
-    arr_lo, arr_hi = _balanced_slice(cm, cm.index('[', np_m.end()))
-    data  = cm[arr_lo:arr_hi]
-    spans = _split_trace_objects(data)
-
-    new_traces = []
-    for a, b in spans:
-        tr      = data[a:b]
-        entries = _hovertext_entries(tr)
-        if not entries:
-            new_traces.append(tr)
-            continue
-
-        fcf_vals = []
-        for entry in entries:
-            fcf_m = re.search(r'FCF ([+-]?\d+\.?\d*)%', entry)
-            fcf_vals.append(float(fcf_m.group(1)) if fcf_m else None)
-
-        new_sizes = [_fcf_to_size(f) for f in fcf_vals]
-        tr = re.sub(
-            r'"size":\[[^\]]*\]',
-            '"size":[' + ','.join(repr(s) for s in new_sizes) + ']',
-            tr, count=1)
-        new_traces.append(tr)
-
-    new_data = data[:spans[0][0]]
-    for idx, (a, b) in enumerate(spans):
-        new_data += new_traces[idx]
-        sep_end   = spans[idx + 1][0] if idx + 1 < len(spans) else len(data)
-        new_data += data[b:sep_end]
-
-    new_cm = cm[:arr_lo] + new_data + cm[arr_hi:]
-    return html[:cm_seg.start()] + new_cm + html[cm_seg.end():]
-
-
-# ── 8. COT Positioning Regime → Macro & Regime section ───────────────────────
+# ── 2. COT Positioning Regime → Macro & Regime section ───────────────────────
 
 def extract_cot_regime_block(cot_html):
     """
@@ -653,27 +228,19 @@ def inject_cot_into_macro_regime(index_html, cot_block):
     return index_html[:macro_seg.start()] + new_section + index_html[macro_seg.end():]
 
 
-# ── 9. Page navigation ────────────────────────────────────────────────────────
+def inject_cot_css(html):
+    """Ensure the COT block CSS is present in index.html (idempotent)."""
+    if COT_BLOCK_CSS in html or '</style>' not in html:
+        return html
+    return html.replace('</style>', COT_BLOCK_CSS + '</style>', 1)
 
-def add_index_nav(html):
-    """Inject nav bar CSS and HTML into index.html (idempotent)."""
-    css_needed = ''
-    if COT_BLOCK_CSS not in html:
-        css_needed += COT_BLOCK_CSS
-    if NAV_CSS not in html:
-        css_needed += NAV_CSS
-    if css_needed:
-        html = html.replace('</style>', css_needed + '</style>', 1)
 
-    if 'class="page-nav"' not in html:
-        html = re.sub(r'(</header>)', r'\1' + INDEX_NAV_HTML, html, count=1)
-    return html
-
+# ── 3. Navigation bar for the COT page ───────────────────────────────────────
 
 def add_cot_nav(html):
     """Inject nav bar CSS and HTML into COT_Analysis_Latest.html (idempotent)."""
-    if 'class="page-nav"' in html:
-        return html  # already present
+    if 'page-nav' in html:  # quote-insensitive: already has a nav
+        return html
     if '</style>' in html:
         html = html.replace('</style>', COT_NAV_CSS + '</style>', 1)
     else:
@@ -702,48 +269,19 @@ def main():
     html = open(path, encoding='utf-8').read()
 
     if not cot_only:
-        html = move_hq_and_renumber(html)
-        print('✓ HQ section moved and sections renumbered', file=sys.stderr)
-
-        html = hoist_plotly_to_head(html)
-        print('✓ Plotly scripts hoisted into <head>', file=sys.stderr)
-
         html = sort_signal_matrix(html)
         print('✓ Signal Matrix sorted by conviction', file=sys.stderr)
 
-        html = make_collapsible(html)
-        html = inject_css(html)
-        print('✓ Collapsible sections applied', file=sys.stderr)
-
-        html = convert_hq_xaxis_to_pct(html)
-        print('✓ HQ Buys x-axis converted to % from spot', file=sys.stderr)
-
-        lookup = build_quality_lookup(html)
-        print(f'✓ Quality lookup: {len(lookup)} tickers', file=sys.stderr)
-        html = inject_quality_metrics(html, lookup)
-        print('✓ ROIC/FCF injected into Conviction Map', file=sys.stderr)
-
-        name_lookup = build_company_name_lookup(html)
-        print(f'✓ Company name lookup: {len(name_lookup)} tickers', file=sys.stderr)
-        html = inject_qv_company_names(html, name_lookup)
-        print('✓ Company names injected into Quality × Valuation', file=sys.stderr)
-
-        html = scale_conviction_map_by_fcf(html)
-        print('✓ Conviction Map bubbles scaled by FCF yield', file=sys.stderr)
-
-    # COT Positioning Regime injection
+    # COT Positioning Regime injection (from the COT-Analysis repo)
     cot_html = None
     if cot_path and os.path.exists(cot_path):
         cot_html = open(cot_path, encoding='utf-8').read()
         cot_block = extract_cot_regime_block(cot_html)
         if cot_block:
+            html = inject_cot_css(html)
             html = inject_cot_into_macro_regime(html, cot_block)
             print('✓ COT Positioning Regime injected into Macro & Regime',
                   file=sys.stderr)
-
-    # Navigation bar
-    html = add_index_nav(html)
-    print('✓ Nav bar added to index.html', file=sys.stderr)
 
     open(path, 'w', encoding='utf-8').write(html)
 

@@ -42,7 +42,7 @@ jobs:
             exit 1
           fi
 
-      - name: Inject ROIC & FCF into Conviction Map tooltips
+      - name: Sort Signal Matrix and inject COT regime
         run: python3 .github/scripts/inject_quality_metrics.py index.html
 
       - name: Commit and push if changed
